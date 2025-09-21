@@ -143,8 +143,8 @@ def load_config():
     
     config = {
         'S3_BUCKET': os.getenv('S3_BUCKET_NAME', 'cacheme-documents'),
-        'S3_REGION': os.getenv('AWS_REGION', 'ap-southeast-1'),
-        'QUERY_LAMBDA_ARN': os.getenv('QUERY_LAMBDA_ARN', 'arn:aws:lambda:ap-southeast-1:339712974969:function:query-lambda'),
+        'S3_REGION': os.getenv('AWS_REGION', 'ap-southeast-5'),
+        'QUERY_LAMBDA_ARN': os.getenv('QUERY_LAMBDA_ARN', 'arn:aws:lambda:ap-southeast-5:339712974969:function:query-lambda'),
         'AWS_ACCESS_KEY_ID': os.getenv('AWS_ACCESS_KEY_ID'),
         'AWS_SECRET_ACCESS_KEY': os.getenv('AWS_SECRET_ACCESS_KEY'),
         'OPENSEARCH_ENDPOINT': os.getenv('OPENSEARCH_ENDPOINT')
