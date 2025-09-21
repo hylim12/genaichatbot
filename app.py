@@ -2,7 +2,7 @@ import streamlit as st
 import boto3
 from botocore.exceptions import ClientError
 from io import BytesIO
-import requests
+from dotenv import load_dotenv
 import json
 from datetime import datetime
 import time
@@ -61,6 +61,7 @@ st.markdown("""
         background-color: #f8f9fa;
         border: 1px solid #dee2e6;
         margin-right: 20%;
+        color: #212529;  /* Dark text color for better visibility */
     }
     .document-snippet {
         background-color: #fff3cd;
@@ -84,38 +85,94 @@ st.markdown("""
         border-radius: 5px;
         border: 1px solid #c3e6cb;
     }
+    .success-banner {
+        background-color: #27ae60;
+        color: white;
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 1rem 0;
+        text-align: center;
+    }
+    .info-banner {
+        background-color: #3498db;
+        color: white;
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 1rem 0;
+        text-align: center;
+    }
 </style>
 """, unsafe_allow_html=True)
 
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
 # Configuration with fallback handling
 try:
-    S3_BUCKET = os.environ.get('S3_BUCKET_NAME', st.secrets.get('S3_BUCKET_NAME', 'cacheme-documents'))
-    S3_REGION = os.environ.get('AWS_REGION', st.secrets.get('AWS_REGION', 'ap-southeast-5'))
-    API_BASE_URL = os.environ.get('API_BASE_URL', st.secrets.get('API_BASE_URL', 'http://localhost:8000'))
-    AWS_ACCESS_KEY_ID = os.environ.get('AWS_ACCESS_KEY_ID', st.secrets.get('AWS_ACCESS_KEY_ID'))
-    AWS_SECRET_ACCESS_KEY = os.environ.get('AWS_SECRET_ACCESS_KEY', st.secrets.get('AWS_SECRET_ACCESS_KEY'))
+    # Load environment variables explicitly
+    load_dotenv(verbose=True)  # Enable verbose mode to see which variables are loaded
+    
+    S3_BUCKET = os.getenv('S3_BUCKET_NAME', 'cacheme-documents')
+    S3_REGION = os.getenv('AWS_REGION', 'ap-southeast-1')  # Updated to match AWS console region
+    QUERY_LAMBDA_ARN = os.getenv('QUERY_LAMBDA_ARN', 'arn:aws:lambda:ap-southeast-1:339712974969:function:query-lambda')
+    AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
+    AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+    OPENSEARCH_ENDPOINT = os.getenv('OPENSEARCH_ENDPOINT')
+    
+    # Debug information (will be removed in production)
+    st.sidebar.markdown("### Debug Information")
+    st.sidebar.text(f"Region: {S3_REGION}")
+    st.sidebar.text(f"Bucket: {S3_BUCKET}")
+    st.sidebar.text(f"Access Key ID: {'Set' if AWS_ACCESS_KEY_ID else 'Not Set'}")
+    st.sidebar.text(f"Secret Key: {'Set' if AWS_SECRET_ACCESS_KEY else 'Not Set'}")
+    
+    if not (AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY):
+        raise ValueError("AWS credentials not found in environment variables")
 except Exception as e:
-    st.error(f"Error loading secrets or environment variables: {str(e)}. Using defaults or environment variables. Please configure secrets.toml or set environment variables.")
-    S3_BUCKET = os.environ.get('S3_BUCKET_NAME', 'cacheme-documents')
-    S3_REGION = os.environ.get('AWS_REGION', 'ap-southeast-5')
-    API_BASE_URL = os.environ.get('API_BASE_URL', 'http://localhost:8000')
-    AWS_ACCESS_KEY_ID = os.environ.get('AWS_ACCESS_KEY_ID')
-    AWS_SECRET_ACCESS_KEY = os.environ.get('AWS_SECRET_ACCESS_KEY')
+    st.error(f"Error loading environment variables: {str(e)}. Please check your .env file.")
 
-UPLOAD_ENDPOINT = f"{API_BASE_URL}/upload"
-CHAT_ENDPOINT = f"{API_BASE_URL}/chat"
-
-# Initialize S3 client with fallbacks
+# Initialize AWS clients
 try:
+    # Create AWS clients with credentials
+    sts = boto3.client(
+        'sts',
+        region_name=S3_REGION,
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+    )
+    
+    # Verify credentials
+    identity = sts.get_caller_identity()
+    st.sidebar.success(f"✅ AWS Credentials Valid\nAccount: {identity['Account']}")
+    
+    # Initialize other clients
     s3_client = boto3.client(
         's3',
         region_name=S3_REGION,
         aws_access_key_id=AWS_ACCESS_KEY_ID,
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY
     )
+    
+    lambda_client = boto3.client(
+        'lambda',
+        region_name=S3_REGION,
+        aws_access_key_id=AWS_ACCESS_KEY_ID,
+        aws_secret_access_key=AWS_SECRET_ACCESS_KEY
+    )
+    
 except Exception as e:
-    st.error(f"Failed to initialize S3 client: {str(e)}. Please check your AWS credentials and region.")
+    error_message = str(e)
+    if 'InvalidAccessKeyId' in error_message:
+        st.error("❌ Invalid AWS Access Key ID. Please check if your credentials are correct and not expired.")
+    elif 'SignatureDoesNotMatch' in error_message:
+        st.error("❌ Invalid AWS Secret Access Key. Please check if your secret key is correct.")
+    elif 'ExpiredToken' in error_message:
+        st.error("❌ AWS credentials have expired. Please refresh your credentials.")
+    else:
+        st.error(f"❌ Failed to initialize AWS clients: {error_message}")
     s3_client = None
+    lambda_client = None
 
 # Initialize session state
 def initialize_session_state():
@@ -129,7 +186,7 @@ def initialize_session_state():
 
 def upload_file_to_s3(file_content: bytes, filename: str) -> Dict[str, Any]:
     """
-    Upload file directly to S3
+    Upload file directly to S3 and trigger ingestion
     
     Args:
         file_content: File content as bytes
@@ -139,35 +196,159 @@ def upload_file_to_s3(file_content: bytes, filename: str) -> Dict[str, Any]:
         Response status
     """
     if s3_client is None:
-        return {"success": False, "error": "S3 client not initialized"}
+        return {"success": False, "error": "S3 client not initialized. Please check your AWS credentials."}
     try:
+        # Generate a unique S3 key for the file
         s3_key = f"uploads/{uuid.uuid4()}_{filename}"
-        s3_client.upload_fileobj(BytesIO(file_content), S3_BUCKET, s3_key, ExtraArgs={'ContentType': 'application/pdf'})
-        return {"success": True, "data": {"s3_key": s3_key}}
+        
+        # Upload to S3
+        s3_client.upload_fileobj(
+            BytesIO(file_content), 
+            S3_BUCKET, 
+            s3_key, 
+            ExtraArgs={
+                'ContentType': 'application/pdf',
+                'Metadata': {
+                    'filename': filename,
+                    'upload_time': datetime.now().isoformat()
+                }
+            }
+        )
+        
+        # Wait briefly to ensure S3 consistency
+        time.sleep(1)
+        
+        return {
+            "success": True, 
+            "data": {
+                "s3_key": s3_key,
+                "bucket": S3_BUCKET,
+                "filename": filename
+            }
+        }
     except ClientError as e:
-        return {"success": False, "error": f"S3 upload failed: {str(e)}"}
+        error_msg = str(e)
+        if 'AccessDenied' in error_msg:
+            return {"success": False, "error": "Access denied to S3. Please check your AWS credentials and permissions."}
+        elif 'NoSuchBucket' in error_msg:
+            return {"success": False, "error": f"S3 bucket '{S3_BUCKET}' not found. Please check your configuration."}
+        else:
+            return {"success": False, "error": f"S3 upload failed: {error_msg}"}
 
-def send_chat_message(message: str) -> Dict[str, Any]:
+def send_chat_message(message: str, max_retries: int = 3) -> Dict[str, Any]:
     """
-    Send chat message to backend API
+    Send chat message to Query Lambda with retry logic
     
     Args:
         message: User's question/message
+        max_retries: Maximum number of retry attempts
         
     Returns:
-        Response from the API
+        Response from the Query Lambda
     """
-    try:
-        payload = {"message": message}
-        response = requests.post(CHAT_ENDPOINT, json=payload, timeout=30)
-        
-        if response.status_code == 200:
-            return {"success": True, "data": response.json()}
-        else:
-            return {"success": False, "error": f"Chat failed: {response.status_code}"}
+    if lambda_client is None:
+        return {
+            "success": True,
+            "data": {
+                "response": "I'm not connected to AWS services right now. Please check your AWS credentials and region settings.",
+                "snippets": []
+            }
+        }
+
+    for attempt in range(max_retries):
+        try:
+            payload = {"query": message}
+            response = lambda_client.invoke(
+                FunctionName=QUERY_LAMBDA_ARN,
+                InvocationType='RequestResponse',
+                Payload=json.dumps(payload)
+            )
+            response_body = json.loads(response['Payload'].read().decode('utf-8'))
             
-    except requests.exceptions.RequestException as e:
-        return {"success": False, "error": f"Connection error: {str(e)}"}
+            if 'statusCode' in response_body and response_body['statusCode'] == 200:
+                return {"success": True, "data": response_body['body']}
+            
+            # Handle specific error cases that might be retryable
+            error_msg = response_body.get('body', {}).get('error', 'Unknown error')
+            if any(retryable in error_msg.lower() for retryable in ['timeout', 'throttle', 'temporary']):
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) + 0.5  # Exponential backoff
+                    time.sleep(wait_time)
+                    continue
+                    
+            # Non-retryable error or max retries reached
+            return {
+                "success": True,
+                "data": {
+                    "response": f"I encountered an error: {error_msg}. Please try again or rephrase your question.",
+                    "snippets": []
+                }
+            }
+            
+        except ClientError as e:
+            error_message = str(e)
+            
+            # Handle specific AWS errors
+            if 'UnrecognizedClientException' in error_message:
+                return {
+                    "success": True,
+                    "data": {
+                        "response": "Invalid AWS credentials. Please check your AWS access key and secret key.",
+                        "snippets": []
+                    }
+                }
+            elif 'AccessDeniedException' in error_message:
+                return {
+                    "success": True,
+                    "data": {
+                        "response": "Access denied. Please check your AWS IAM permissions.",
+                        "snippets": []
+                    }
+                }
+            elif any(retryable in error_message.lower() for retryable in ['timeout', 'throttle', 'temporary']):
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) + 0.5
+                    time.sleep(wait_time)
+                    continue
+            
+            return {
+                "success": True,
+                "data": {
+                    "response": f"AWS service error: {error_message}",
+                    "snippets": []
+                }
+            }
+            
+        except json.JSONDecodeError:
+            return {
+                "success": True,
+                "data": {
+                    "response": "Received invalid response format. Please try again.",
+                    "snippets": []
+                }
+            }
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) + 0.5
+                time.sleep(wait_time)
+                continue
+                
+            return {
+                "success": True,
+                "data": {
+                    "response": f"An unexpected error occurred: {str(e)}",
+                    "snippets": []
+                }
+            }
+    
+    return {
+        "success": True,
+        "data": {
+            "response": "Request failed after multiple attempts. Please try again later.",
+            "snippets": []
+        }
+    }
 
 def display_chat_message(message: Dict[str, Any], is_user: bool = False):
     """
@@ -177,29 +358,47 @@ def display_chat_message(message: Dict[str, Any], is_user: bool = False):
         message: Message content
         is_user: Whether this is a user message
     """
-    if is_user:
-        st.markdown(f"""
-        <div class="chat-message user-message">
-            <strong>You:</strong> {message['content']}
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.markdown(f"""
-        <div class="chat-message ai-message">
-            <strong>AI Assistant:</strong> {message['content']}
-        </div>
-        """, unsafe_allow_html=True)
-        
-        # Display document snippets if available
-        if 'snippets' in message and message['snippets']:
-            st.markdown("**Relevant Document Snippets:**")
-            for snippet in message['snippets']:
+    try:
+        if is_user:
+            st.markdown(f"""
+            <div class="chat-message user-message">
+                <strong>You:</strong> {message['content']}
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            try:
+                # Try to parse as JSON if it's a string and looks like JSON
+                if isinstance(message['content'], str) and message['content'].strip().startswith('{'):
+                    response_data = json.loads(message['content'])
+                else:
+                    response_data = message['content'] if isinstance(message['content'], dict) else {'response': message['content']}
+                
                 st.markdown(f"""
-                <div class="document-snippet">
-                    <strong>From:</strong> {snippet.get('source', 'Unknown document')}<br>
-                    {snippet.get('text', '')}
+                <div class="chat-message ai-message">
+                    <strong>AI Assistant:</strong> {response_data.get('response', 'No response received')}
                 </div>
                 """, unsafe_allow_html=True)
+                
+                # Display document snippets if available
+                snippets = response_data.get('snippets', [])
+                if snippets:
+                    st.markdown("**Relevant Document Snippets:**")
+                    for snippet in snippets:
+                        st.markdown(f"""
+                        <div class="document-snippet">
+                            <strong>From:</strong> {snippet.get('source', 'Unknown document')}<br>
+                            {snippet.get('text', '')}
+                        </div>
+                        """, unsafe_allow_html=True)
+            except json.JSONDecodeError:
+                # If JSON parsing fails, display the content as is
+                st.markdown(f"""
+                <div class="chat-message ai-message">
+                    <strong>AI Assistant:</strong> {message['content']}
+                </div>
+                """, unsafe_allow_html=True)
+    except Exception as e:
+        st.error(f"Error displaying message: {str(e)}")
 
 def main():
     """Main application function"""
@@ -230,56 +429,156 @@ def main():
             
             # Upload button
             if st.button("📤 Upload to System", type="primary"):
-                with st.spinner("Uploading file..."):
+                progress_placeholder = st.empty()
+                status_placeholder = st.empty()
+                
+                with progress_placeholder.container():
+                    progress_bar = st.progress(0)
+                    status_placeholder.text("Preparing file for upload...")
+                    time.sleep(0.5)
+                    progress_bar.progress(25)
+                    
+                    # Upload file
                     file_content = uploaded_file.read()
+                    status_placeholder.text("Uploading to S3...")
                     result = upload_file_to_s3(file_content, uploaded_file.name)
+                    progress_bar.progress(50)
                     
                     if result["success"]:
+                        status_placeholder.text("Processing document...")
+                        progress_bar.progress(75)
+                        
+                        # Add to session state
                         st.session_state.uploaded_files.append({
                             "name": uploaded_file.name,
                             "size": uploaded_file.size,
                             "upload_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "status": "success",
+                            "status": "processing",
                             "s3_key": result["data"]["s3_key"]
                         })
+                        
+                        # Wait briefly to simulate processing time and allow ingestion lambda to start
+                        time.sleep(2)
+                        progress_bar.progress(100)
+                        status_placeholder.text("Document ready!")
+                        
+                        st.success("✅ Document uploaded and processed successfully!")
+                        st.info("📝 You can now ask questions about this document.")
+                        
+                        # Update final status
                         st.session_state.upload_status[uploaded_file.name] = "success"
-                        st.success(f"✅ Successfully uploaded {uploaded_file.name} to S3")
                     else:
                         st.session_state.upload_status[uploaded_file.name] = "error"
                         st.error(f"❌ Upload failed: {result['error']}")
         
         st.markdown('</div>', unsafe_allow_html=True)
         
+        # Add custom CSS for file list
+        st.markdown("""
+        <style>
+        .file-list-container {
+            background-color: #2d3436;
+            border-radius: 10px;
+            padding: 15px;
+            margin: 10px 0;
+        }
+        .file-item {
+            background-color: #34495e;
+            border-radius: 8px;
+            padding: 12px;
+            margin: 8px 0;
+        }
+        .file-name {
+            color: #3498db;
+            font-size: 1.1em;
+            font-weight: bold;
+        }
+        .file-details {
+            color: #bdc3c7;
+            font-size: 0.9em;
+            margin-top: 5px;
+        }
+        .success-icon {
+            color: #2ecc71;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
         # Display uploaded files
         if st.session_state.uploaded_files:
-            st.markdown("### 📋 Uploaded Files")
-            st.markdown('<div class="file-list">', unsafe_allow_html=True)
+            st.markdown("### 📚 Document Library")
             
             for file_info in st.session_state.uploaded_files:
-                status_icon = "✅" if file_info["status"] == "success" else "❌"
-                st.write(f"{status_icon} **{file_info['name']}**")
-                st.write(f"   Size: {file_info['size']:,} bytes")
-                st.write(f"   Uploaded: {file_info['upload_time']}")
-                st.write(f"   S3 Key: {file_info['s3_key']}")
-                st.write("---")
-            
-            st.markdown('</div>', unsafe_allow_html=True)
+                st.markdown(f"""
+                <div class="file-list-container">
+                    <div class="file-item">
+                        <div class="file-name">
+                            <span class="success-icon">✓</span> {file_info['name']}
+                        </div>
+                        <div class="file-details">
+                            📊 Size: {file_info['size']:,} bytes<br>
+                            🕒 Uploaded: {file_info['upload_time']}
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
         
         # Document preview section
         if uploaded_file is not None:
             st.markdown("### 👁️ Document Preview")
-            st.info("📄 PDF preview would be displayed here. For now, showing file information.")
-            st.json({
-                "filename": uploaded_file.name,
-                "size": f"{uploaded_file.size:,} bytes",
-                "type": uploaded_file.type
-            })
+            preview_container = st.container()
+            with preview_container:
+                st.markdown("""
+                <style>
+                    .pdf-preview {
+                        background-color: #2d3436;
+                        border-radius: 10px;
+                        padding: 20px;
+                        margin: 10px 0;
+                    }
+                    .file-info {
+                        color: #dfe6e9;
+                        font-family: monospace;
+                        margin-bottom: 10px;
+                    }
+                    .preview-header {
+                        color: #74b9ff;
+                        font-size: 1.1em;
+                        margin-bottom: 15px;
+                    }
+                </style>
+                """, unsafe_allow_html=True)
+                
+                st.markdown('<div class="pdf-preview">', unsafe_allow_html=True)
+                st.markdown('<div class="preview-header">📄 Document Information</div>', unsafe_allow_html=True)
+                
+                # Display file information in a formatted way
+                st.markdown(f"""
+                <div class="file-info">
+                    <strong>File Name:</strong> {uploaded_file.name}<br>
+                    <strong>Size:</strong> {uploaded_file.size:,} bytes<br>
+                    <strong>Type:</strong> {uploaded_file.type}<br>
+                    <strong>Status:</strong> Ready for processing
+                </div>
+                """, unsafe_allow_html=True)
+                
+                st.markdown('</div>', unsafe_allow_html=True)
     
     with col2:
         # Sidebar chat interface
         st.markdown("### 💬 Chat Interface")
         
-        # Chat input
+        # Chat input and guidance
+        if not st.session_state.uploaded_files:
+            st.warning("👋 Please upload some documents first before asking questions.")
+            
+        st.markdown("""
+        **Tips for better results:**
+        - Be specific in your questions
+        - Mention key terms from your documents
+        - Ask one question at a time
+        """)
+        
         user_input = st.text_area(
             "Ask a question about your documents:",
             height=100,
@@ -309,26 +608,64 @@ def main():
             }
             st.session_state.chat_history.append(user_message)
             
-            # Send to backend and get response
-            with st.spinner("🤔 Thinking..."):
-                result = send_chat_message(user_input)
-                
-                if result["success"]:
-                    ai_response = {
-                        "content": result["data"].get("response", "No response received"),
-                        "timestamp": datetime.now().strftime("%H:%M:%S"),
-                        "type": "ai",
-                        "snippets": result["data"].get("snippets", [])
-                    }
-                    st.session_state.chat_history.append(ai_response)
-                else:
-                    error_response = {
-                        "content": f"Sorry, I encountered an error: {result['error']}",
-                        "timestamp": datetime.now().strftime("%H:%M:%S"),
-                        "type": "ai",
-                        "snippets": []
-                    }
-                    st.session_state.chat_history.append(error_response)
+            # Send to Query Lambda and get response
+            status_placeholder = st.empty()
+            with status_placeholder:
+                with st.spinner("🔍 Searching through documents..."):
+                    result = send_chat_message(user_input)
+                    
+                    if result["success"]:
+                        try:
+                            # Handle different response formats
+                            if isinstance(result["data"], str):
+                                try:
+                                    response_data = json.loads(result["data"])
+                                except json.JSONDecodeError:
+                                    # If it's not valid JSON, treat it as a plain string response
+                                    response_data = {"response": result["data"], "snippets": []}
+                            else:
+                                response_data = result["data"]
+                            
+                            # Ensure response_data is a dictionary
+                            if not isinstance(response_data, dict):
+                                response_data = {"response": str(response_data), "snippets": []}
+                                
+                            # Check if we have any relevant snippets
+                            snippets = response_data.get("snippets", [])
+                            if snippets:
+                                status_placeholder.success("📚 Found relevant information!")
+                            else:
+                                status_placeholder.info("🔍 No exact matches found, but I'll try to help.")
+                            
+                            ai_response = {
+                                "content": response_data,
+                                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                "type": "ai",
+                                "snippets": snippets
+                            }
+                            st.session_state.chat_history.append(ai_response)
+                        except json.JSONDecodeError:
+                            status_placeholder.warning("⚠️ Received unexpected response format")
+                            error_response = {
+                                "content": {
+                                    "response": "I received an invalid response format. Please try asking your question again.",
+                                    "snippets": []
+                                },
+                                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                                "type": "ai"
+                            }
+                            st.session_state.chat_history.append(error_response)
+                    else:
+                        status_placeholder.error("❌ Error processing your request")
+                        error_response = {
+                            "content": {
+                                "response": f"Sorry, I encountered an error: {result.get('error', 'Unknown error')}",
+                                "snippets": []
+                            },
+                            "timestamp": datetime.now().strftime("%H:%M:%S"),
+                            "type": "ai"
+                        }
+                        st.session_state.chat_history.append(error_response)
             
             st.rerun()
         
