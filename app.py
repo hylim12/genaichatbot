@@ -51,10 +51,6 @@ st.markdown("""
         padding: 1rem;
         margin: 0.5rem 0;
         border-radius: 10px;
-        min-height: auto;
-        height: auto;
-        word-wrap: break-word;
-        white-space: pre-wrap;
     }
     .user-message {
         background-color: #007bff;
@@ -88,18 +84,6 @@ st.markdown("""
         border-radius: 5px;
         border: 1px solid #c3e6cb;
     }
-    .document-viewer {
-        background-color: #f8f9fa;
-        padding: 1.5rem;
-        border-radius: 10px;
-        border: 2px solid #dee2e6;
-        margin-top: 1rem;
-    }
-    .file-action-button {
-        margin: 0.2rem;
-        padding: 0.3rem 0.6rem;
-        font-size: 0.8rem;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -110,7 +94,6 @@ try:
     API_BASE_URL = os.environ.get('API_BASE_URL', st.secrets.get('API_BASE_URL', 'http://localhost:8000'))
     AWS_ACCESS_KEY_ID = os.environ.get('AWS_ACCESS_KEY_ID', st.secrets.get('AWS_ACCESS_KEY_ID'))
     AWS_SECRET_ACCESS_KEY = os.environ.get('AWS_SECRET_ACCESS_KEY', st.secrets.get('AWS_SECRET_ACCESS_KEY'))
-    LAMBDA_FUNCTION_NAME = os.environ.get('LAMBDA_FUNCTION_NAME', st.secrets.get('LAMBDA_FUNCTION_NAME', 'document-search-lambda'))
 except Exception as e:
     st.error(f"Error loading secrets or environment variables: {str(e)}. Using defaults or environment variables. Please configure secrets.toml or set environment variables.")
     S3_BUCKET = os.environ.get('S3_BUCKET_NAME', 'cacheme-documents')
@@ -118,12 +101,11 @@ except Exception as e:
     API_BASE_URL = os.environ.get('API_BASE_URL', 'http://localhost:8000')
     AWS_ACCESS_KEY_ID = os.environ.get('AWS_ACCESS_KEY_ID')
     AWS_SECRET_ACCESS_KEY = os.environ.get('AWS_SECRET_ACCESS_KEY')
-    LAMBDA_FUNCTION_NAME = os.environ.get('LAMBDA_FUNCTION_NAME', 'document-search-lambda')
 
 UPLOAD_ENDPOINT = f"{API_BASE_URL}/upload"
 CHAT_ENDPOINT = f"{API_BASE_URL}/chat"
 
-# Initialize AWS clients with fallbacks
+# Initialize S3 client with fallbacks
 try:
     s3_client = boto3.client(
         's3',
@@ -131,16 +113,9 @@ try:
         aws_access_key_id=AWS_ACCESS_KEY_ID,
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY
     )
-    lambda_client = boto3.client(
-        'lambda',
-        region_name=S3_REGION,
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY
-    )
 except Exception as e:
-    st.error(f"Failed to initialize AWS clients: {str(e)}. Please check your AWS credentials and region.")
+    st.error(f"Failed to initialize S3 client: {str(e)}. Please check your AWS credentials and region.")
     s3_client = None
-    lambda_client = None
 
 # Initialize session state
 def initialize_session_state():
@@ -151,16 +126,6 @@ def initialize_session_state():
         st.session_state.uploaded_files = []
     if 'upload_status' not in st.session_state:
         st.session_state.upload_status = {}
-    if 'selected_file' not in st.session_state:
-        st.session_state.selected_file = None
-    
-    # Auto-select first uploaded file if none is selected
-    if st.session_state.selected_file is None and st.session_state.uploaded_files:
-        # Find the first successfully uploaded file
-        for file_info in st.session_state.uploaded_files:
-            if file_info["status"] == "success":
-                st.session_state.selected_file = file_info
-                break
 
 def upload_file_to_s3(file_content: bytes, filename: str) -> Dict[str, Any]:
     """
@@ -182,57 +147,9 @@ def upload_file_to_s3(file_content: bytes, filename: str) -> Dict[str, Any]:
     except ClientError as e:
         return {"success": False, "error": f"S3 upload failed: {str(e)}"}
 
-def send_chat_message_direct(message: str) -> Dict[str, Any]:
+def send_chat_message(message: str) -> Dict[str, Any]:
     """
-    Send chat message directly to Lambda function
-    
-    Args:
-        message: User's question/message
-        
-    Returns:
-        Response from Lambda
-    """
-    if lambda_client is None:
-        return {"success": False, "error": "Lambda client not initialized"}
-    
-    try:
-        # Prepare payload for Lambda
-        payload = {
-            'message': message,
-            'bucket': S3_BUCKET,
-            'timestamp': datetime.now().isoformat()
-        }
-        
-        # Invoke Lambda function directly
-        response = lambda_client.invoke(
-            FunctionName=LAMBDA_FUNCTION_NAME,
-            InvocationType='RequestResponse',
-            Payload=json.dumps(payload)
-        )
-        
-        # Parse response
-        if response['StatusCode'] == 200:
-            payload = json.loads(response['Payload'].read())
-            # Handle Lambda response format (statusCode + body)
-            if 'statusCode' in payload:
-                if payload['statusCode'] == 200:
-                    body = json.loads(payload['body'])
-                    return {"success": True, "data": body}
-                else:
-                    error_body = json.loads(payload['body'])
-                    return {"success": False, "error": error_body.get('error', 'Lambda error')}
-            else:
-                # Direct response format
-                return {"success": True, "data": payload}
-        else:
-            return {"success": False, "error": f"Lambda returned status {response['StatusCode']}"}
-            
-    except Exception as e:
-        return {"success": False, "error": f"Lambda call failed: {str(e)}"}
-
-def send_chat_message_backend(message: str) -> Dict[str, Any]:
-    """
-    Send chat message to backend API (fallback method)
+    Send chat message to backend API
     
     Args:
         message: User's question/message
@@ -300,200 +217,90 @@ def main():
         st.markdown("### 📄 Document Upload")
         st.markdown('<div class="upload-section">', unsafe_allow_html=True)
         
-        uploaded_files = st.file_uploader(
-            "Choose PDF files",
+        uploaded_file = st.file_uploader(
+            "Choose a PDF file",
             type=['pdf'],
-            help="Upload internal documents like guidelines, manuals, and policies",
-            accept_multiple_files=True
+            help="Upload internal documents like guidelines, manuals, and policies"
         )
         
-        if uploaded_files:
-            # Display selected files
-            st.write(f"**Selected Files:** {len(uploaded_files)}")
-            for i, file in enumerate(uploaded_files):
-                st.write(f"📄 {i+1}. {file.name} ({file.size:,} bytes)")
+        if uploaded_file is not None:
+            # Display file info
+            st.write(f"**File:** {uploaded_file.name}")
+            st.write(f"**Size:** {uploaded_file.size:,} bytes")
             
             # Upload button
-            if st.button("📤 Upload All Files to System", type="primary"):
-                upload_results = []
-                first_uploaded_file = None
-                with st.spinner("Uploading files..."):
-                    for file in uploaded_files:
-                        file_content = file.read()
-                        result = upload_file_to_s3(file_content, file.name)
-                        
-                        if result["success"]:
-                            file_info = {
-                                "name": file.name,
-                                "size": file.size,
-                                "upload_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                                "status": "success",
-                                "s3_key": result["data"]["s3_key"],
-                                "file_id": str(uuid.uuid4())
-                            }
-                            st.session_state.uploaded_files.append(file_info)
-                            st.session_state.upload_status[file.name] = "success"
-                            upload_results.append(f"✅ {file.name}")
-                            
-                            # Set the first successfully uploaded file as selected
-                            if first_uploaded_file is None:
-                                first_uploaded_file = file_info
-                                st.session_state.selected_file = file_info
-                        else:
-                            st.session_state.upload_status[file.name] = "error"
-                            upload_results.append(f"❌ {file.name}: {result['error']}")
-                
-                # Display upload results
-                for result in upload_results:
-                    if result.startswith("✅"):
-                        st.success(result)
+            if st.button("📤 Upload to System", type="primary"):
+                with st.spinner("Uploading file..."):
+                    file_content = uploaded_file.read()
+                    result = upload_file_to_s3(file_content, uploaded_file.name)
+                    
+                    if result["success"]:
+                        st.session_state.uploaded_files.append({
+                            "name": uploaded_file.name,
+                            "size": uploaded_file.size,
+                            "upload_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "status": "success",
+                            "s3_key": result["data"]["s3_key"]
+                        })
+                        st.session_state.upload_status[uploaded_file.name] = "success"
+                        st.success(f"✅ Successfully uploaded {uploaded_file.name} to S3")
                     else:
-                        st.error(result)
-                
-                # Clear the file uploader after successful uploads
-                if any(result.startswith("✅") for result in upload_results):
-                    st.rerun()
-        
-        # PDF Display Section - show PDF of selected file
-        if st.session_state.selected_file:
-            selected_file = st.session_state.selected_file
-            st.markdown("### 📄 PDF Display")
-            
-            try:
-                # Try to download and display PDF from S3
-                if s3_client:
-                    response = s3_client.get_object(Bucket=S3_BUCKET, Key=selected_file['s3_key'])
-                    pdf_content = response['Body'].read()
-                    
-                    st.info(f"📄 **Displaying:** {selected_file['name']}")
-                    
-                    # Display PDF using Streamlit's built-in PDF viewer
-                    st.download_button(
-                        label="📥 Download PDF",
-                        data=pdf_content,
-                        file_name=selected_file['name'],
-                        mime="application/pdf"
-                    )
-                    
-                    # Show PDF preview placeholder
-                    st.markdown("**PDF Content:**")
-                    st.text_area(
-                        "PDF Preview",
-                        value=f"PDF content of '{selected_file['name']}' would be displayed here.\n\nTo view the full document, please download it using the button above.",
-                        height=200,
-                        disabled=True
-                    )
-                else:
-                    st.error("S3 client not available. Cannot display PDF.")
-            except Exception as e:
-                st.error(f"Error loading PDF: {str(e)}")
-        else:
-            st.markdown("### 📄 PDF Display")
-            if st.session_state.uploaded_files:
-                st.info("👆 **Click on a document name in 'Uploaded Documents' to display it here**")
-            else:
-                st.info("📄 **Upload documents to display them here**")
+                        st.session_state.upload_status[uploaded_file.name] = "error"
+                        st.error(f"❌ Upload failed: {result['error']}")
         
         st.markdown('</div>', unsafe_allow_html=True)
         
-        # Display uploaded documents
+        # Display uploaded files
         if st.session_state.uploaded_files:
-            st.markdown("### 📋 Uploaded Documents")
+            st.markdown("### 📋 Uploaded Files")
             st.markdown('<div class="file-list">', unsafe_allow_html=True)
             
-            for i, file_info in enumerate(st.session_state.uploaded_files):
+            for file_info in st.session_state.uploaded_files:
                 status_icon = "✅" if file_info["status"] == "success" else "❌"
-                is_selected = st.session_state.selected_file and st.session_state.selected_file.get('file_id') == file_info.get('file_id')
-                
-                # Create columns for file name and actions
-                col_info, col_action = st.columns([3, 1])
-                
-                with col_info:
-                    # Make file name clickable
-                    if file_info["status"] == "success":
-                        if st.button(f"{status_icon} {file_info['name']}", key=f"select_{i}", use_container_width=True):
-                            st.session_state.selected_file = file_info
-                            st.rerun()
-                        
-                        # Show file details if this file is selected
-                        if is_selected:
-                            st.markdown("**File Details:**")
-                            
-                            # File Info and S3 Details tabs
-                            tab1, tab2 = st.tabs(["📋 File Info", "🔗 S3 Details"])
-                            
-                            with tab1:
-                                file_info_data = {
-                                    "Filename": file_info['name'],
-                                    "Size": f"{file_info['size']:,} bytes",
-                                    "Upload Time": file_info['upload_time'],
-                                    "Status": file_info['status'],
-                                    "File ID": file_info.get('file_id', 'N/A')
-                                }
-                                st.json(file_info_data)
-                            
-                            with tab2:
-                                s3_info = {
-                                    "S3 Bucket": S3_BUCKET,
-                                    "S3 Key": file_info['s3_key'],
-                                    "Region": S3_REGION,
-                                    "S3 URL": f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{file_info['s3_key']}"
-                                }
-                                st.json(s3_info)
-                                
-                                # Copy S3 URL button
-                                if st.button("📋 Copy S3 URL", key=f"copy_{i}"):
-                                    st.code(s3_info["S3 URL"])
-                                    st.success("S3 URL copied to clipboard!")
-                    else:
-                        st.write(f"{status_icon} **{file_info['name']}** (Upload Failed)")
-                
-                with col_action:
-                    if st.button("🗑️ Remove", key=f"remove_{i}"):
-                        # If removing the currently selected file, clear selection
-                        if is_selected:
-                            st.session_state.selected_file = None
-                        st.session_state.uploaded_files.pop(i)
-                        st.rerun()
-                
+                st.write(f"{status_icon} **{file_info['name']}**")
+                st.write(f"   Size: {file_info['size']:,} bytes")
+                st.write(f"   Uploaded: {file_info['upload_time']}")
+                st.write(f"   S3 Key: {file_info['s3_key']}")
                 st.write("---")
             
             st.markdown('</div>', unsafe_allow_html=True)
         
+        # Document preview section
+        if uploaded_file is not None:
+            st.markdown("### 👁️ Document Preview")
+            st.info("📄 PDF preview would be displayed here. For now, showing file information.")
+            st.json({
+                "filename": uploaded_file.name,
+                "size": f"{uploaded_file.size:,} bytes",
+                "type": uploaded_file.type
+            })
     
     with col2:
-        # Unified Chat Interface with Scrollable Container
-        st.markdown("### 💬 Chat")
+        # Sidebar chat interface
+        st.markdown("### 💬 Chat Interface")
         
-        # Use st.container with height parameter for fixed height scrollable area
-        with st.container(height=400):
-            # Chat history display
-            if not st.session_state.chat_history:
-                st.info("Start a conversation by asking a question about your documents!")
-            else:
-                # Display chat messages
-                for message in st.session_state.chat_history:
-                    display_chat_message(message, is_user=(message["type"] == "user"))
-                    st.write("")  # Add spacing between messages
+        # Chat input
+        user_input = st.text_area(
+            "Ask a question about your documents:",
+            height=100,
+            placeholder="e.g., What are the safety guidelines for equipment maintenance?"
+        )
         
-        # Chat input area with Enter key support
-        col_input, col_clear = st.columns([3, 1])
+        col_send, col_clear = st.columns([1, 1])
         
-        with col_input:
-            user_input = st.chat_input(
-                "Ask a question about your documents"
-            )
+        with col_send:
+            send_button = st.button("🚀 Send", type="primary", disabled=not user_input.strip())
         
         with col_clear:
-            clear_button = st.button("New Chat")
+            clear_button = st.button("🗑️ Clear Chat")
         
         # Handle clear chat
         if clear_button:
             st.session_state.chat_history = []
             st.rerun()
         
-        # Handle send message (works with Enter key or Send button)
-        if user_input:
+        # Handle send message
+        if send_button and user_input.strip():
             # Add user message to history
             user_message = {
                 "content": user_input,
@@ -502,13 +309,9 @@ def main():
             }
             st.session_state.chat_history.append(user_message)
             
-            # Send to Lambda directly (no backend needed!)
+            # Send to backend and get response
             with st.spinner("🤔 Thinking..."):
-                # Try direct Lambda first, fallback to backend if needed
-                if lambda_client is not None:
-                    result = send_chat_message_direct(user_input)
-                else:
-                    result = send_chat_message_backend(user_input)
+                result = send_chat_message(user_input)
                 
                 if result["success"]:
                     ai_response = {
@@ -528,6 +331,20 @@ def main():
                     st.session_state.chat_history.append(error_response)
             
             st.rerun()
+        
+        # Display chat history
+        st.markdown("### 💭 Conversation History")
+        
+        if not st.session_state.chat_history:
+            st.info("👋 Start a conversation by asking a question about your documents!")
+        else:
+            # Create a scrollable container for chat history
+            chat_container = st.container()
+            
+            with chat_container:
+                for message in st.session_state.chat_history:
+                    display_chat_message(message, is_user=(message["type"] == "user"))
+                    st.write("")  # Add spacing between messages
     
     # Footer
     st.markdown("---")
