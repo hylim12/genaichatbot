@@ -2,7 +2,6 @@ import streamlit as st
 import boto3
 from botocore.exceptions import ClientError
 from io import BytesIO
-from dotenv import load_dotenv
 import json
 from datetime import datetime
 import time
